@@ -1,0 +1,26 @@
+[package]
+name = "claudeterm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal dashboard for Claude Code: live sessions, subagents, git worktrees and token usage"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tomgutgar/claudeterm"
+readme = "README.md"
+keywords = ["claude", "claude-code", "tui", "ratatui", "dashboard"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/.github", "/assets/build.py", "/install.ps1"]
+
+[[bin]]
+name = "cct"
+path = "src/main.rs"
+
+# Same ideas as DevTerminal: few dependencies, and wrap the CLIs that already
+# exist (git, kitty, notify-send) instead of reimplementing them.
+[dependencies]
+anyhow = "1"
+# line_count: to open the transcript at the end.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }

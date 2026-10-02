@@ -1,0 +1,60 @@
+# Push a tag like v0.1.0 to publish a GitHub release with prebuilt binaries.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: test "v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" = "$GITHUB_REF_NAME"
+      # Draft until every binary is uploaded: a failed build leaves no public release.
+      - run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: create
+    strategy:
+      matrix:
+        include:
+          # 22.04 for an older glibc, so the binary runs on more distros.
+          - os: ubuntu-22.04
+            archive: cct-${{ github.ref_name }}-x86_64-linux.tar.gz
+          - os: windows-latest
+            archive: cct-${{ github.ref_name }}-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo build --release --locked
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar czf "${{ matrix.archive }}" -C target/release cct -C "$GITHUB_WORKSPACE" README.md LICENSE
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/cct.exe, README.md, LICENSE, assets/logo.ico -DestinationPath "${{ matrix.archive }}"
+      - run: gh release upload "${{ github.ref_name }}" "${{ matrix.archive }}" --clobber
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}
