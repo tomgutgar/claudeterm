@@ -1,9 +1,14 @@
-//! claudeterm (`cct`): a terminal dashboard for Claude Code.
+//! claudeterm (`cct`): a terminal dashboard for Claude Code, Antigravity,
+//! Codex and Kimi Code.
 //! The main loop and the floating windows come from DevTerminal.
 
+mod agy;
 mod cli;
+mod codex;
 mod data;
+mod hub;
 mod i18n;
+mod kimi;
 mod platform;
 mod ui;
 mod views;
@@ -25,6 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use data::{Cli, Store};
 use i18n::tr;
 use ui::{block, block_c, centered};
 use views::{Action, View};
@@ -35,6 +41,21 @@ const AUTO_REFRESH: Duration = Duration::from_secs(2);
 const IDLE_CHECK: Duration = Duration::from_secs(1);
 /// Two clicks on the same row within this = double click (Enter).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Redraw interval while something is animated (the home screen).
+const FRAME: Duration = Duration::from_millis(100);
+
+/// A set of tabs: the home screen (no CLI) or one CLI's dashboard.
+struct Screen {
+    views: Vec<Box<dyn View>>,
+    active: usize,
+    cli: Option<Cli>,
+}
+
+/// Index in `App::screens`.
+const HOME: usize = 0;
+fn screen_of(cli: Cli) -> usize {
+    1 + cli as usize
+}
 
 /// Clickable area recorded while drawing.
 enum Hit {
@@ -63,14 +84,16 @@ enum Overlay {
 }
 
 struct App {
-    views: Vec<Box<dyn View>>,
-    active: usize,
+    /// Home, then one per CLI (`screen_of`).
+    screens: [Screen; 5],
+    screen: usize,
     overlay: Option<Overlay>,
-    store: data::Store,
+    /// One per CLI, indexed by `Cli as usize`.
+    stores: [Store; 4],
     last_refresh: Instant,
     last_idle_check: Instant,
-    /// Last seen status of each pid (busy/idle), to notify on change.
-    statuses: HashMap<u32, String>,
+    /// Last seen status of each live session (busy/idle), to notify on change.
+    statuses: HashMap<String, String>,
     pending_refresh: bool,
     notice: Option<String>,
     /// Tabs and buttons from the last draw.
@@ -82,6 +105,7 @@ struct App {
 }
 
 fn main() -> Result<()> {
+    let mut start = HOME;
     match std::env::args().nth(1).as_deref() {
         Some("--statusline") => return cli::statusline(),
         Some("--waybar") => return cli::waybar(),
@@ -94,17 +118,25 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 tr(
-                    "cct: panel de control de Claude Code en la terminal\n\n\
+                    "cct: panel de control de Claude Code, Antigravity, Codex y Kimi Code en la terminal\n\n\
                      Uso: cct [opción]\n\n  \
-                     (nada)         abre el panel\n  \
+                     (nada)         abre la pantalla de inicio\n  \
+                     --claude       abre directamente el panel de Claude Code\n  \
+                     --agy          abre directamente el panel de Antigravity\n  \
+                     --codex        abre directamente el panel de Codex\n  \
+                     --kimi         abre directamente el panel de Kimi Code\n  \
                      --mini         ventana pequeña con el % de los límites\n  \
                      --statusline   statusline de Claude Code (lee JSON por stdin)\n  \
                      --waybar       módulo JSON para Waybar\n  \
                      -V, --version  versión\n  \
                      -h, --help     esta ayuda",
-                    "cct: terminal dashboard for Claude Code\n\n\
+                    "cct: terminal dashboard for Claude Code, Antigravity, Codex and Kimi Code\n\n\
                      Usage: cct [option]\n\n  \
-                     (none)         open the dashboard\n  \
+                     (none)         open the home screen\n  \
+                     --claude       open the Claude Code dashboard directly\n  \
+                     --agy          open the Antigravity dashboard directly\n  \
+                     --codex        open the Codex dashboard directly\n  \
+                     --kimi         open the Kimi Code dashboard directly\n  \
                      --mini         small window with the limits' %\n  \
                      --statusline   Claude Code statusline (reads JSON on stdin)\n  \
                      --waybar       JSON module for Waybar\n  \
@@ -114,6 +146,10 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Some("--claude") => start = screen_of(Cli::Claude),
+        Some("--agy") => start = screen_of(Cli::Agy),
+        Some("--codex") => start = screen_of(Cli::Codex),
+        Some("--kimi") => start = screen_of(Cli::Kimi),
         Some(other) => bail!(tr!(
             "opción desconocida: {other} (prueba --help)",
             "unknown option: {other} (try --help)"
@@ -129,7 +165,7 @@ fn main() -> Result<()> {
         hook(info);
     }));
     let mut terminal = init_terminal()?;
-    let mut app = App::new();
+    let mut app = App::new(start);
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.run(&mut terminal);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -138,12 +174,30 @@ fn main() -> Result<()> {
 }
 
 impl App {
-    fn new() -> Self {
-        Self {
-            views: views::all(),
+    fn new(screen: usize) -> Self {
+        let dash = |cli| Screen {
+            views: views::all(cli),
             active: 0,
+            cli: Some(cli),
+        };
+        Self {
+            screens: [
+                Screen {
+                    views: vec![
+                        Box::new(hub::Picker::default()),
+                        Box::new(hub::Hub::default()),
+                    ],
+                    active: 0,
+                    cli: None,
+                },
+                dash(Cli::Claude),
+                dash(Cli::Agy),
+                dash(Cli::Codex),
+                dash(Cli::Kimi),
+            ],
+            screen,
             overlay: None,
-            store: data::Store::new(),
+            stores: Store::all(),
             last_refresh: Instant::now(),
             last_idle_check: Instant::now(),
             statuses: HashMap::new(),
@@ -155,27 +209,55 @@ impl App {
         }
     }
 
+    fn view(&mut self) -> &mut dyn View {
+        let s = &mut self.screens[self.screen];
+        s.views[s.active].as_mut()
+    }
+
+    /// Rereads what the current tab shows (the home screen shows every CLI).
     fn refresh_active(&mut self) {
-        self.store.refresh();
-        self.views[self.active].refresh(&self.store);
+        let s = &mut self.screens[self.screen];
+        let v = &mut s.views[s.active];
+        match s.cli {
+            Some(cli) => {
+                let st = &mut self.stores[cli as usize];
+                st.refresh();
+                v.refresh(st);
+            }
+            None => {
+                for st in &mut self.stores {
+                    st.refresh();
+                }
+                v.refresh_all(&self.stores);
+            }
+        }
         self.last_refresh = Instant::now();
     }
 
-    /// busy → idle = Claude finished and is waiting for you: desktop notification.
+    /// busy → idle = a session finished and is waiting for you: desktop notification.
     fn check_idle(&mut self) {
         self.last_idle_check = Instant::now();
-        let live = data::live_sessions(&self.store.root);
         let mut next = HashMap::new();
-        for l in &live {
-            if self.statuses.get(&l.pid).is_some_and(|s| s == "busy") && l.status == "idle" {
-                let body = format!(
-                    "{} · {}",
-                    data::title(&self.store.windows, l),
-                    views::short_path(&l.cwd)
-                );
-                platform::notify_idle(body, self.store.windows.get(&l.pid).map(|w| w.pid));
+        for cli in Cli::ALL {
+            let st = &mut self.stores[cli as usize];
+            let live = match cli {
+                Cli::Claude => data::live_sessions(&st.root),
+                Cli::Agy => agy::live_sessions(st),
+                // Neither leaves a cheap "who's running" file: reread (only
+                // what's new) and take what that found.
+                Cli::Codex | Cli::Kimi => {
+                    st.refresh();
+                    st.live.clone()
+                }
+            };
+            for l in &live {
+                if self.statuses.get(&l.session).is_some_and(|s| s == "busy") && l.status == "idle"
+                {
+                    let body = format!("{} · {}", l.name, views::short_path(&l.cwd));
+                    platform::notify_idle(cli.name(), body);
+                }
+                next.insert(l.session.clone(), l.status.clone());
             }
-            next.insert(l.pid, l.status.clone());
         }
         self.statuses = next;
     }
@@ -189,7 +271,12 @@ impl App {
                 self.refresh_active();
                 continue;
             }
-            if !event::poll(Duration::from_millis(250))? {
+            let wait = if self.view().animated() {
+                FRAME
+            } else {
+                Duration::from_millis(250)
+            };
+            if !event::poll(wait)? {
                 if self.last_idle_check.elapsed() >= IDLE_CHECK {
                     self.check_idle();
                 }
@@ -216,7 +303,7 @@ impl App {
             self.overlay_key(key);
             return false;
         }
-        match self.views[self.active].on_key(key) {
+        match self.view().on_key(key) {
             Action::Ignored => return self.global_key(key),
             Action::Handled => {}
             Action::Refresh => self.pending_refresh = true,
@@ -250,6 +337,10 @@ impl App {
                     scroll: u16::MAX,
                 })
             }
+            Action::Open(cli) => {
+                self.screen = screen_of(cli);
+                self.pending_refresh = true;
+            }
         }
         false
     }
@@ -279,8 +370,9 @@ impl App {
                 if let Some(i) = self.hits.iter().position(|(r, _)| inside(r)) {
                     return match self.hits[i].1 {
                         Hit::Tab(t) => {
-                            if t != self.active {
-                                self.active = t;
+                            let s = &mut self.screens[self.screen];
+                            if t != s.active {
+                                s.active = t;
                                 self.pending_refresh = true;
                             }
                             false
@@ -294,10 +386,7 @@ impl App {
                     }
                     return false;
                 }
-                let Some(list) = self.views[self.active].list() else {
-                    return false;
-                };
-                if !list.click(x, y) {
+                if !self.view().click(x, y) {
                     return false;
                 }
                 let double = self
@@ -312,15 +401,23 @@ impl App {
 
     /// true = quit.
     fn global_key(&mut self, key: KeyEvent) -> bool {
-        let n = self.views.len();
-        let prev = self.active;
+        let screen = self.screen;
+        let s = &mut self.screens[screen];
+        let n = s.views.len();
+        let prev = s.active;
         match key.code {
             KeyCode::Char('q' | 'Q') => return true,
-            KeyCode::Tab | KeyCode::Char('d' | 'D') => self.active = (self.active + 1) % n,
-            KeyCode::BackTab | KeyCode::Char('a' | 'A') => self.active = (self.active + n - 1) % n,
+            // Back to the home screen.
+            KeyCode::Esc | KeyCode::Backspace if screen != HOME => {
+                self.screen = HOME;
+                self.pending_refresh = true;
+                return false;
+            }
+            KeyCode::Tab | KeyCode::Char('d' | 'D') => s.active = (s.active + 1) % n,
+            KeyCode::BackTab | KeyCode::Char('a' | 'A') => s.active = (s.active + n - 1) % n,
             KeyCode::Char('r' | 'R') => self.pending_refresh = true,
             KeyCode::Char('y' | 'Y') => {
-                if let Some(text) = self.views[self.active].clip() {
+                if let Some(text) = s.views[s.active].clip() {
                     self.notice = Some(match platform::copy(&text) {
                         Ok(()) => tr!("Copiado: {text}", "Copied: {text}"),
                         Err(e) => tr!("Portapapeles: {e}", "Clipboard: {e}"),
@@ -330,12 +427,12 @@ impl App {
             KeyCode::Char(c @ '1'..='9') => {
                 let i = c as usize - '1' as usize;
                 if i < n {
-                    self.active = i;
+                    s.active = i;
                 }
             }
             _ => {}
         }
-        if self.active != prev {
+        if self.screens[screen].active != prev {
             self.pending_refresh = true;
         }
         false
@@ -461,14 +558,15 @@ impl App {
         ])
         .areas(f.area());
 
-        let accent = self.views[self.active].accent();
-        let titles: Vec<Line> = self
+        let s = &self.screens[self.screen];
+        let accent = s.views[s.active].accent();
+        let titles: Vec<Line> = s
             .views
             .iter()
             .enumerate()
             .map(|(i, v)| {
                 let mut style = Style::default().fg(v.accent());
-                if i == self.active {
+                if i == s.active {
                     style = style.add_modifier(Modifier::BOLD);
                 }
                 Line::from(Span::styled(format!("{} {}", i + 1, v.title()), style))
@@ -477,10 +575,15 @@ impl App {
         let busy = self.statuses.values().filter(|s| *s == "busy").count();
         let idle = self.statuses.len() - busy;
         let spin = if self.pending_refresh { " ⟳" } else { "" };
+        let place = s
+            .cli
+            .map(|c| format!(" › {}", c.name()))
+            .unwrap_or_default();
         let brand = tr!(
-            "claudeterm{spin} · ● {busy} trabajando · ◌ {idle} esperando",
-            "claudeterm{spin} · ● {busy} working · ◌ {idle} waiting"
+            "claudeterm{place}{spin} · ● {busy} trabajando · ◌ {idle} esperando",
+            "claudeterm{place}{spin} · ● {busy} working · ◌ {idle} waiting"
         );
+        let (active, n_tabs, on_home) = (s.active, s.views.len(), s.cli.is_none());
         self.hits = tab_rects(header, &titles)
             .into_iter()
             .enumerate()
@@ -488,19 +591,42 @@ impl App {
             .collect();
         f.render_widget(
             Tabs::new(titles)
-                .select(self.active)
+                .select(active)
                 .block(block_c(&brand, accent)),
             header,
         );
+        // Clickable way back to the home screen, on the header's top border.
+        if !on_home {
+            let back = tr(" ← Esc inicio ", " ← Esc home ");
+            let w = back.chars().count() as u16;
+            if header.width > w + 2 {
+                let r = Rect::new(header.right() - w - 2, header.y, w, 1);
+                f.render_widget(
+                    Paragraph::new(back).style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    r,
+                );
+                self.hits.push((r, Hit::Key(KeyCode::Esc)));
+            }
+        }
 
-        self.views[self.active].draw(f, body);
+        self.view().draw(f, body);
 
         let text = match &self.notice {
             Some(n) => format!(" {n}"),
+            None if on_home => tr!(
+                " {} · Tab/A/D pestaña · 1-{n_tabs} saltar · R refrescar · Q salir",
+                " {} · Tab/A/D tab · 1-{n_tabs} jump · R refresh · Q quit",
+                self.view().footer()
+            ),
             None => tr!(
-                " {} · y copiar · Tab/A/D pestaña · 1-4 saltar · R refrescar · Q salir",
-                " {} · y copy · Tab/A/D tab · 1-4 jump · R refresh · Q quit",
-                self.views[self.active].footer()
+                " {} · y copiar · Tab/A/D pestaña · 1-{n_tabs} saltar · Esc inicio · Q salir",
+                " {} · y copy · Tab/A/D tab · 1-{n_tabs} jump · Esc home · Q quit",
+                self.view().footer()
             ),
         };
         f.render_widget(

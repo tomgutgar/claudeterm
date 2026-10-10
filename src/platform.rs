@@ -60,7 +60,7 @@ pub fn ui_lang() -> String {
 }
 
 /// Keeps the console window always on top (for `cct --mini`). Windows only;
-/// on Linux the window manager does it (Hyprland rules).
+/// on Linux that's up to the window manager's rules.
 pub fn stay_on_top() {
     if WIN {
         win::stay_on_top();
@@ -88,6 +88,77 @@ pub fn alive(pid: u32, start: &str) -> bool {
         .is_some_and(|s| s == start)
 }
 
+/// Is that pid alive and did it start around `unix` (seconds)? For processes
+/// that don't store their own start time (agy only logs its pid).
+pub fn started_near(pid: u32, unix: i64) -> bool {
+    const SLACK: i64 = 120;
+    start_unix(pid).is_some_and(|s| (s - unix).abs() <= SLACK)
+}
+
+/// When a live process started, Unix seconds.
+fn start_unix(pid: u32) -> Option<i64> {
+    if WIN {
+        // FILETIME: 100 ns since 1601.
+        win::create_time(pid).map(|ft| (ft / 10_000_000) as i64 - 11_644_473_600)
+    } else {
+        // ponytail: assumes 100 clock ticks per second (sysconf(_SC_CLK_TCK) on
+        // every mainstream Linux); read it via libc if that ever bites.
+        let ticks = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(19)?
+                    .parse::<i64>()
+                    .ok()
+            });
+        let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime "))?
+                .trim()
+                .parse::<i64>()
+                .ok()
+        });
+        ticks.zip(boot).map(|(t, b)| b + t / 100)
+    }
+}
+
+/// Start time (Unix seconds) of every running process whose executable is
+/// called one of `names` (without ".exe"). For CLIs that leave no pid on disk.
+pub fn procs(names: &[&str]) -> Vec<i64> {
+    let pids: Vec<u32> = if WIN {
+        win::processes()
+            .into_iter()
+            .filter(|(_, exe)| {
+                let stem = exe.strip_suffix(".exe").unwrap_or(exe);
+                names.iter().any(|n| stem.eq_ignore_ascii_case(n))
+            })
+            .map(|(pid, _)| pid)
+            .collect()
+    } else {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                // comm is the executable (cut at 15 chars); a Node app that sets
+                // process.title shows it as argv[0] instead.
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                let argv0 = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let argv0 = String::from_utf8_lossy(argv0.split(|&b| b == 0).next().unwrap_or(&[]))
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                names.iter().any(|n| comm.trim() == *n || argv0 == *n)
+            })
+            .collect()
+    };
+    pids.into_iter().filter_map(start_unix).collect()
+}
+
 #[cfg(windows)]
 mod win {
     #[link(name = "kernel32")]
@@ -105,6 +176,48 @@ mod win {
         fn CloseHandle(h: isize) -> i32;
         fn GetUserDefaultUILanguage() -> u16;
         fn GetConsoleWindow() -> isize;
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+        fn Process32FirstW(snap: isize, entry: *mut ProcessEntry) -> i32;
+        fn Process32NextW(snap: isize, entry: *mut ProcessEntry) -> i32;
+    }
+
+    /// PROCESSENTRY32W.
+    #[repr(C)]
+    struct ProcessEntry {
+        size: u32,
+        usage: u32,
+        pid: u32,
+        heap: usize,
+        module: u32,
+        threads: u32,
+        parent: u32,
+        priority: i32,
+        flags: u32,
+        exe: [u16; 260],
+    }
+
+    /// (pid, executable name) of every process.
+    pub fn processes() -> Vec<(u32, String)> {
+        const TH32CS_SNAPPROCESS: u32 = 2;
+        let mut out = Vec::new();
+        // SAFETY: `e` is a local with `size` set as the API requires; the
+        // snapshot handle is always closed.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == -1 {
+                return out;
+            }
+            let mut e: ProcessEntry = std::mem::zeroed();
+            e.size = size_of::<ProcessEntry>() as u32;
+            let mut ok = Process32FirstW(snap, &mut e);
+            while ok != 0 {
+                let len = e.exe.iter().position(|&c| c == 0).unwrap_or(e.exe.len());
+                out.push((e.pid, String::from_utf16_lossy(&e.exe[..len])));
+                ok = Process32NextW(snap, &mut e);
+            }
+            CloseHandle(snap);
+        }
+        out
     }
 
     #[link(name = "user32")]
@@ -178,6 +291,10 @@ mod win {
         None
     }
 
+    pub fn processes() -> Vec<(u32, String)> {
+        Vec::new()
+    }
+
     pub fn ui_is_es() -> bool {
         false
     }
@@ -199,7 +316,7 @@ fn on_path(prog: &str) -> bool {
     })
 }
 
-/// The terminal `open_claude` will use, if it isn't installed. Needed because
+/// The terminal `open_cli` will use, if it isn't installed. Needed because
 /// on Linux `setsid -f` returns at once, so a missing terminal would fail
 /// silently.
 pub fn terminal_missing() -> Option<String> {
@@ -214,12 +331,12 @@ pub fn terminal_missing() -> Option<String> {
     (!on_path(&prog)).then_some(prog)
 }
 
-/// Opens Claude Code in a new terminal. On Linux, `setsid -f` detaches it (the
+/// Opens `prog` (claude or agy) in a new terminal. On Linux, `setsid -f` detaches it (the
 /// window survives if you close claudeterm) and the terminal is
 /// `$CCT_TERMINAL` (kitty by default; e.g. "alacritty -e" or
 /// "gnome-terminal --"). On Windows, Windows Terminal with the cmd profile (its
 /// GUID is the same on every install), so it doesn't open in conhost.
-pub fn open_claude(cwd: &str, claude_args: &[&str]) -> Vec<String> {
+pub fn open_cli(prog: &str, cwd: &str, args: &[&str]) -> Vec<String> {
     let mut cmd = if WIN {
         // wt splits its command line on `;` (even inside a path); `\;` escapes it.
         let dir = cwd.replace(';', r"\;");
@@ -231,20 +348,21 @@ pub fn open_claude(cwd: &str, claude_args: &[&str]) -> Vec<String> {
             &dir,
             "cmd",
             "/k",
-            "claude",
+            prog,
         ])
     } else {
-        // $0 = directory, "$@" = claude's arguments.
+        // $0 = directory, $1 = program, "$@" = its arguments.
         s(&[
             "setsid",
             "-f",
             "sh",
             "-c",
-            r#"cd "$0" && exec ${CCT_TERMINAL:-kitty} claude "$@""#,
+            r#"cd "$0" && exec ${CCT_TERMINAL:-kitty} "$@""#,
             cwd,
+            prog,
         ])
     };
-    cmd.extend(s(claude_args));
+    cmd.extend(s(args));
     cmd
 }
 
@@ -257,14 +375,11 @@ pub fn kill(pid: u32) -> Vec<String> {
     }
 }
 
-/// "Claude is waiting for you" notification, in its own thread (notify-send
-/// blocks until clicked). On Linux, if its window is known, it has a "Go"
-/// action (in mako, clicking the notification is enough) that focuses it. On
-/// Windows, a toast with PowerShell's AppID and no "Go": there is no way to
-/// tell which window each session runs in.
-pub fn notify_idle(body: String, window: Option<u64>) {
-    let title = crate::i18n::tr("Claude espera tu mensaje", "Claude is waiting for you");
-    let go = crate::i18n::tr("default=Ir a la ventana", "default=Go to window");
+/// "<who> is waiting for you" notification, in its own thread so a slow
+/// notifier never stalls the UI: notify-send on Linux, a toast with
+/// PowerShell's AppID on Windows.
+pub fn notify_idle(who: &str, body: String) {
+    let title = crate::tr!("{who} espera tu mensaje", "{who} is waiting for you");
     const PS: &str = r"
 $m = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
 $x = $m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -277,7 +392,7 @@ $m::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShel
         if WIN {
             let _ = Command::new("powershell")
                 .args(["-NoProfile", "-NonInteractive", "-Command", PS])
-                .env("CCT_TITLE", title)
+                .env("CCT_TITLE", &title)
                 .env("CCT_BODY", body)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -285,30 +400,12 @@ $m::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShel
                 .status();
             return;
         }
-        let mut cmd = Command::new("notify-send");
-        cmd.args(["-a", "claudeterm"]);
-        if window.is_some() {
-            cmd.args(["-A", go]);
-        }
-        let Ok(out) = cmd.args([title, &body]).stderr(Stdio::null()).output() else {
-            return;
-        };
-        if let Some(pid) = window
-            && String::from_utf8_lossy(&out.stdout).trim() == "default"
-        {
-            let _ = crate::run_cmd(&focus_cmd(pid));
-        }
+        let _ = Command::new("notify-send")
+            .args(["-a", "claudeterm", &title, &body])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     });
-}
-
-/// Moves focus (and the workspace) to that pid's window. Hyprland only.
-pub fn focus_cmd(window_pid: u64) -> Vec<String> {
-    vec![
-        "hyprctl".into(),
-        "dispatch".into(),
-        "focuswindow".into(),
-        format!("pid:{window_pid}"),
-    ]
 }
 
 /// Copies to the clipboard. clip.exe detects UTF-16LE (with a BOM, the BOM

@@ -27,5 +27,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install 1.88 --profile minimal
-      - run: cargo +1.88 check --locked
+      - run: rustup toolchain install 1.89 --profile minimal
+      - run: cargo +1.89 check --locked

@@ -20,6 +20,63 @@ use serde_json::Value;
 use crate::i18n::tr;
 use crate::platform;
 
+/// Which agent CLI a `Store` reads.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Cli {
+    #[default]
+    Claude,
+    Agy,
+    Codex,
+    Kimi,
+}
+
+impl Cli {
+    /// In this order everywhere: home screen, hub, `Store`s.
+    pub const ALL: [Cli; 4] = [Cli::Claude, Cli::Agy, Cli::Codex, Cli::Kimi];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Cli::Claude => "Claude Code",
+            Cli::Agy => "Antigravity",
+            Cli::Codex => "Codex",
+            Cli::Kimi => "Kimi Code",
+        }
+    }
+    /// The command that starts it.
+    pub fn prog(self) -> &'static str {
+        match self {
+            Cli::Claude => "claude",
+            Cli::Agy => "agy",
+            Cli::Codex => "codex",
+            Cli::Kimi => "kimi",
+        }
+    }
+    /// What goes before a session id to resume it (`codex resume <id>`).
+    pub fn resume_flag(self) -> &'static str {
+        match self {
+            Cli::Claude => "--resume",
+            Cli::Agy => "--conversation",
+            Cli::Codex => "resume",
+            Cli::Kimi => "--session",
+        }
+    }
+    pub fn color(self) -> ratatui::style::Color {
+        use ratatui::style::Color::Rgb;
+        match self {
+            Cli::Claude => Rgb(0xd9, 0x77, 0x57),
+            Cli::Agy => Rgb(0x4f, 0x8f, 0xf7),
+            // OpenAI's green: Codex's own accent is the terminal's default colour.
+            Cli::Codex => Rgb(0x10, 0xa3, 0x7f),
+            // The logo's colour in kimi's welcome box (dark theme `primary`).
+            Cli::Kimi => Rgb(0x4f, 0xa8, 0xff),
+        }
+    }
+    /// Has a price table (`PRICES`): the others show tokens only.
+    pub fn priced(self) -> bool {
+        self == Cli::Claude
+    }
+}
+
 #[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
@@ -43,7 +100,7 @@ impl Usage {
     }
 
     /// What `self` has and `o` lacks, field by field (never negative).
-    fn minus(&self, o: &Usage) -> Usage {
+    pub fn minus(&self, o: &Usage) -> Usage {
         Usage {
             input: self.input.saturating_sub(o.input),
             output: self.output.saturating_sub(o.output),
@@ -165,8 +222,13 @@ impl Footprint {
 /// real history: Opus sessions reached ~688k tokens before compacting, so in
 /// Claude Code the window is 1M.
 pub fn context_window(model: &str) -> u64 {
+    // ponytail: agy stores 256k as the window of every Gemini model it has
+    // used so far; read it from the conversation if that stops being true.
+    // ponytail: Kimi's wire log doesn't store the window; K2/K3 have 256k.
     if model.contains("haiku") {
         200_000
+    } else if model.starts_with("gemini") || model.contains("kimi") {
+        256_000
     } else {
         1_000_000
     }
@@ -195,6 +257,21 @@ pub struct Session {
     pub model: String,
     /// Context tokens of the last turn.
     pub context: u64,
+    /// The model's context window, when the CLI writes it down (Codex); 0 =
+    /// guess it from the model with `context_window`.
+    pub window: u64,
+}
+
+impl Session {
+    /// % of the context window used on the last turn.
+    pub fn context_pct(&self) -> u64 {
+        let w = if self.window > 0 {
+            self.window
+        } else {
+            context_window(&self.model)
+        };
+        self.context * 100 / w.max(1)
+    }
 }
 
 pub struct Agent {
@@ -204,6 +281,21 @@ pub struct Agent {
     pub desc: String,
     pub path: PathBuf,
     pub mtime: SystemTime,
+    /// Its last line is its final answer: finished.
+    pub done: bool,
+}
+
+/// A command a session left running in the background (Bash with
+/// `run_in_background`).
+pub struct Shell {
+    pub id: String,
+    pub session: String,
+    /// The subagent that launched it, if it wasn't the session itself.
+    pub agent: Option<String>,
+    pub desc: String,
+    /// Where Claude Code writes its output: if it changes, it's working.
+    pub output: PathBuf,
+    pub done: bool,
 }
 
 /// A `claude` running right now (`~/.claude/sessions/<pid>.json`).
@@ -220,7 +312,7 @@ pub struct Live {
     #[serde(default)]
     pub status: String,
     #[serde(rename = "procStart", default)]
-    proc_start: String,
+    pub(crate) proc_start: String,
 }
 
 // Only the fields we use; serde skips the rest without storing it.
@@ -287,6 +379,7 @@ impl From<RawUsage> for Usage {
 }
 
 pub struct Store {
+    pub cli: Cli,
     pub root: PathBuf,
     /// Bytes already read from each jsonl: each refresh only reads what's new.
     offsets: HashMap<PathBuf, u64>,
@@ -298,13 +391,18 @@ pub struct Store {
     pub sessions: HashMap<String, Session>,
     pub agents: HashMap<String, Agent>,
     pub live: Vec<Live>,
-    /// pid of each live `claude` → its terminal window. Empty without Hyprland.
-    pub windows: HashMap<u32, Window>,
     /// Tokens from days whose transcripts Claude Code already deleted, taken
     /// from our own history. Only for the Usage stats.
     pub archived: Vec<Rec>,
     archive: HashMap<DayKey, Usage>,
     archive_path: Option<PathBuf>,
+    /// Background commands by task id.
+    pub shells: HashMap<String, Shell>,
+    /// tool_use id → description of a background Bash not yet started.
+    pending_shells: HashMap<String, String>,
+    pub agy: crate::agy::State,
+    pub codex: crate::codex::State,
+    pub kimi: crate::kimi::State,
 }
 
 /// (local day, model, directory)
@@ -369,8 +467,24 @@ impl Store {
         st
     }
 
+    /// The store of each CLI, in `Cli::ALL` order. Only Claude Code's keeps a
+    /// history of its own: the others don't delete their old sessions.
+    pub fn all() -> [Self; 4] {
+        let other = |cli, root| Self {
+            cli,
+            ..Self::at(root)
+        };
+        [
+            Self::new(),
+            other(Cli::Agy, crate::agy::root()),
+            other(Cli::Codex, crate::codex::root()),
+            other(Cli::Kimi, crate::kimi::root()),
+        ]
+    }
+
     pub fn at(root: PathBuf) -> Self {
         Self {
+            cli: Cli::Claude,
             root,
             offsets: HashMap::new(),
             seen: HashMap::new(),
@@ -378,16 +492,25 @@ impl Store {
             sessions: HashMap::new(),
             agents: HashMap::new(),
             live: Vec::new(),
-            windows: HashMap::new(),
             archived: Vec::new(),
             archive: HashMap::new(),
             archive_path: None,
+            shells: HashMap::new(),
+            pending_shells: HashMap::new(),
+            agy: Default::default(),
+            codex: Default::default(),
+            kimi: Default::default(),
         }
     }
 
     pub fn refresh(&mut self) {
+        match self.cli {
+            Cli::Claude => {}
+            Cli::Agy => return crate::agy::refresh(self),
+            Cli::Codex => return crate::codex::refresh(self),
+            Cli::Kimi => return crate::kimi::refresh(self),
+        }
         self.live = live_sessions(&self.root);
-        self.windows = windows(&self.live);
         self.scan_projects();
         self.sync_archive();
     }
@@ -544,6 +667,7 @@ impl Store {
                         desc: field("description"),
                         path: p.clone(),
                         mtime,
+                        done: false,
                     },
                 );
             }
@@ -551,33 +675,88 @@ impl Store {
         }
     }
 
-    /// Reads what was appended to the file since last time, line by line
-    /// (only complete lines; memory stays bounded by the longest line).
+    /// Reads what was appended to the file since last time (a file rewritten
+    /// shorter is reread whole: the dedupe avoids double counting).
     fn scan(&mut self, path: &Path, session: &str, agent: Option<&str>) {
-        let Ok(f) = File::open(path) else { return };
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         let mut off = self.offsets.get(path).copied().unwrap_or(0);
-        // File rewritten shorter: reread it all (the dedupe avoids double counting).
-        if len < off {
-            off = 0;
-        }
-        let mut r = BufReader::new(f);
-        if len <= off || r.seek(SeekFrom::Start(off)).is_err() {
-            return;
-        }
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match r.read_until(b'\n', &mut line) {
-                // A last line without '\n' is still being written: next time.
-                Ok(n) if n > 0 && line.ends_with(b"\n") => {
-                    off += n as u64;
-                    self.ingest(String::from_utf8_lossy(&line).trim_end(), session, agent);
+        new_lines(path, &mut off, |text| {
+            if let Some(a) = agent.and_then(|a| self.agents.get_mut(a)) {
+                a.done = text.contains("\"stop_reason\":\"end_turn\"");
+            }
+            self.track_shells(text, session, agent);
+            self.ingest(text, session, agent);
+        });
+        self.offsets.insert(path.to_path_buf(), off);
+    }
+
+    /// Background commands: launched (Bash with `run_in_background`), started
+    /// (its result carries `backgroundTaskId`) and finished (a
+    /// `<task-notification>` with its status).
+    fn track_shells(&mut self, line: &str, session: &str, agent: Option<&str>) {
+        if line.contains("\"run_in_background\":true")
+            && let Ok(v) = serde_json::from_str::<Value>(line)
+        {
+            for b in v["message"]["content"].as_array().into_iter().flatten() {
+                if b["type"] == "tool_use" && b["input"]["run_in_background"] == true {
+                    let input = &b["input"];
+                    let desc = input["description"]
+                        .as_str()
+                        .or(input["command"].as_str())
+                        .unwrap_or("?");
+                    self.pending_shells.insert(
+                        b["id"].as_str().unwrap_or_default().to_string(),
+                        clip(desc.lines().next().unwrap_or(""), 60),
+                    );
                 }
-                _ => break,
             }
         }
-        self.offsets.insert(path.to_path_buf(), off);
+        if line.contains("\"backgroundTaskId\"")
+            && let Ok(v) = serde_json::from_str::<Value>(line)
+            && let Some(id) = v["toolUseResult"]["backgroundTaskId"].as_str()
+        {
+            let block = &v["message"]["content"][0];
+            let text = match &block["content"] {
+                Value::String(s) => s.clone(),
+                Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect(),
+                _ => String::new(),
+            };
+            // "…written to: <dir>/tasks/<id>.output. You will be notified…"
+            let output = text
+                .split_once("Output is being written to: ")
+                .map(|(_, p)| match p.find(".output") {
+                    Some(i) => &p[..i + ".output".len()],
+                    None => p.lines().next().unwrap_or("").trim_end_matches('.'),
+                })
+                .unwrap_or_default();
+            let desc = block["tool_use_id"]
+                .as_str()
+                .and_then(|t| self.pending_shells.remove(t))
+                .unwrap_or_default();
+            self.shells.entry(id.to_string()).or_insert(Shell {
+                id: id.to_string(),
+                session: session.to_string(),
+                agent: agent.map(str::to_string),
+                desc,
+                output: PathBuf::from(output),
+                done: false,
+            });
+        }
+        if line.contains("<task-notification>") {
+            for part in line.split("<task-id>").skip(1) {
+                let Some((id, rest)) = part.split_once("</task-id>") else {
+                    continue;
+                };
+                let status = rest
+                    .split_once("<status>")
+                    .and_then(|(_, s)| s.split_once("</status>"))
+                    .map_or("", |(s, _)| s);
+                if let Some(sh) = self.shells.get_mut(id)
+                    && matches!(status, "completed" | "failed" | "killed" | "stopped")
+                {
+                    sh.done = true;
+                }
+            }
+        }
     }
 
     fn ingest(&mut self, line: &str, session: &str, agent: Option<&str>) {
@@ -650,6 +829,74 @@ impl Store {
     }
 }
 
+/// Calls `f` with each line appended to the file since `off`, and moves `off`
+/// past them. Only complete lines (a last one without '\n' is still being
+/// written: next time); memory stays bounded by the longest line. Returns
+/// whether the file was rewritten shorter: then it's reread from the start.
+pub fn new_lines(path: &Path, off: &mut u64, mut f: impl FnMut(&str)) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let shrunk = len < *off;
+    if shrunk {
+        *off = 0;
+    }
+    let mut r = BufReader::new(file);
+    if len <= *off || r.seek(SeekFrom::Start(*off)).is_err() {
+        return shrunk;
+    }
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match r.read_until(b'\n', &mut line) {
+            Ok(n) if n > 0 && line.ends_with(b"\n") => {
+                *off += n as u64;
+                f(String::from_utf8_lossy(&line).trim_end());
+            }
+            _ => break,
+        }
+    }
+    shrunk
+}
+
+/// What a store found, for the `real_home` tests run against a real home.
+#[cfg(test)]
+pub fn print_store(st: &Store) {
+    let mut total = Usage::default();
+    st.recs.iter().for_each(|r| total.add(&r.usage));
+    println!(
+        "{}: {} sessions, {} replies, {} tokens, {} subagents, {} open",
+        st.root.display(),
+        st.sessions.len(),
+        st.recs.len(),
+        total.total(),
+        st.agents.len(),
+        st.live.len()
+    );
+    let mut sessions: Vec<_> = st.sessions.values().filter(|s| s.last.is_some()).collect();
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last));
+    for s in sessions.iter().take(10) {
+        println!(
+            "  {} · {} · {} · ctx {}% · {}",
+            s.last.unwrap().format("%Y-%m-%d %H:%M"),
+            s.model,
+            s.cwd,
+            s.context_pct(),
+            s.title
+        );
+    }
+    for a in st.agents.values().take(10) {
+        println!(
+            "  agent {} · {} · {} · done {}",
+            a.kind, a.desc, a.session, a.done
+        );
+    }
+    for l in &st.live {
+        println!("  OPEN {} · {} · {}", l.status, l.cwd, l.name);
+    }
+}
+
 /// Text of the first human message (ignores those generated by Claude Code: `<command-…>`, caveats…).
 fn first_prompt(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
@@ -692,15 +939,6 @@ pub fn live_sessions(root: &Path) -> Vec<Live> {
         .collect();
     out.sort_by_key(|l| l.pid);
     out
-}
-
-/// Display name of a live session: its window title or, if there's none, the
-/// name Claude Code gives it.
-pub fn title<'a>(windows: &'a HashMap<u32, Window>, l: &'a Live) -> &'a str {
-    windows
-        .get(&l.pid)
-        .and_then(|w| w.title.as_deref())
-        .unwrap_or(&l.name)
 }
 
 pub fn claude_root() -> PathBuf {
@@ -774,69 +1012,6 @@ pub fn read_limits() -> Option<Limits> {
     let mut l: Limits = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
     l.updated = fs::metadata(&path).and_then(|m| m.modified()).ok();
     Some(l)
-}
-
-/// Hyprland window a session runs in.
-#[derive(Clone)]
-pub struct Window {
-    /// pid of the process owning the window (the terminal): used to focus it.
-    pub pid: u64,
-    /// Title Claude sets (what the conversation is about), unless generic.
-    pub title: Option<String>,
-}
-
-/// Window of each live session. Walks up the parent processes
-/// (claude → terminal) until one is a window Hyprland knows about.
-pub fn windows(live: &[Live]) -> HashMap<u32, Window> {
-    let Ok(out) = std::process::Command::new("hyprctl")
-        .args(["clients", "-j"])
-        .output()
-    else {
-        return HashMap::new();
-    };
-    let clients: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    let windows: HashMap<u64, &str> = clients
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| Some((c["pid"].as_u64()?, c["title"].as_str()?)))
-        .collect();
-    live.iter()
-        .filter_map(|l| {
-            let mut pid = l.pid as u64;
-            for _ in 0..6 {
-                if let Some(t) = windows.get(&pid) {
-                    return Some((
-                        l.pid,
-                        Window {
-                            pid,
-                            title: clean_title(t),
-                        },
-                    ));
-                }
-                pid = parent(pid)?;
-            }
-            None
-        })
-        .collect()
-}
-
-/// Strips the status icon Claude puts in front ("◐ ", "✳ ") and drops generic
-/// titles.
-fn clean_title(t: &str) -> Option<String> {
-    let t = t.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
-    (!t.is_empty() && t != "claude" && t != "Claude Code").then(|| t.to_string())
-}
-
-fn parent(pid: u64) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-        .filter(|&p| p > 1)
 }
 
 /// Start of the last 5-hour block. As in the subscription: the block starts at
@@ -986,6 +1161,31 @@ mod tests {
         );
     }
 
+    /// Background shells: launched, started (with its output file) and finished.
+    #[test]
+    fn background_shells() {
+        let dir = std::env::temp_dir().join(format!("cct-shells-{}", std::process::id()));
+        let proj = dir.join("projects/-p");
+        fs::create_dir_all(&proj).unwrap();
+        let launch = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"npm run dev","description":"Dev server","run_in_background":true}}]}}"#;
+        let started = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: b1. Output is being written to: C:\\t\\tasks\\b1.output. You will be notified when it completes."}]},"toolUseResult":{"backgroundTaskId":"b1"}}"#;
+        let done = r#"{"type":"user","message":{"content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"}}"#;
+        let file = proj.join("s.jsonl");
+        fs::write(&file, format!("{launch}\n{started}\n")).unwrap();
+        let mut st = Store::at(dir.clone());
+        st.refresh();
+        let sh = &st.shells["b1"];
+        assert_eq!(
+            (sh.desc.as_str(), sh.session.as_str(), sh.done),
+            ("Dev server", "s", false)
+        );
+        assert_eq!(sh.output, PathBuf::from(r"C:\t\tasks\b1.output"));
+        fs::write(&file, format!("{launch}\n{started}\n{done}\n")).unwrap();
+        st.refresh();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(st.shells["b1"].done);
+    }
+
     #[test]
     fn partial_last_line_is_read_later() {
         let dir = std::env::temp_dir().join(format!("cct-partial-{}", std::process::id()));
@@ -1112,15 +1312,6 @@ mod tests {
         assert!((f.water_ml - 2040.0).abs() < 1e-6);
         assert!((f.scaled(RANGE_HIGH).wh - 2040.0).abs() < 1e-6);
         assert!((f.co2_g - 377.4).abs() < 1e-6);
-    }
-
-    #[test]
-    fn titles() {
-        assert_eq!(
-            clean_title("◐ Dashboard for devterminal").as_deref(),
-            Some("Dashboard for devterminal")
-        );
-        assert_eq!(clean_title("✳ Claude Code"), None);
     }
 
     /// Against your real ~/.claude: `cargo test -- --ignored --nocapture real_totals`
