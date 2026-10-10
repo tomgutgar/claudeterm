@@ -129,7 +129,6 @@ pub fn statusline() -> Result<()> {
 /// One JSON line for a Waybar `custom/claude` module (`return-type: json`).
 pub fn waybar() -> Result<()> {
     let live = data::live_sessions(&data::claude_root());
-    let wins = data::windows(&live);
     let busy = live.iter().filter(|l| l.status == "busy").count();
     let idle = live.len() - busy;
     let limits = data::read_limits().unwrap_or_default();
@@ -147,7 +146,7 @@ pub fn waybar() -> Result<()> {
             } else {
                 tr("◌ esperando", "◌ waiting")
             };
-            format!("{st}  {} — {}", data::title(&wins, l), short_path(&l.cwd))
+            format!("{st}  {} — {}", l.name, short_path(&l.cwd))
         })
         .collect();
     if live.is_empty() {

@@ -1,9 +1,9 @@
 [package]
 name = "claudeterm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
-description = "Terminal dashboard for Claude Code: live sessions, subagents, git worktrees and token usage"
+rust-version = "1.89"
+description = "Terminal dashboard for Claude Code, Antigravity, Codex and Kimi Code: live sessions, subagents, background shells, git worktrees and token usage"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tomgutgar/claudeterm"
 readme = "README.md"
@@ -24,3 +24,7 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+# Antigravity keeps its conversations in SQLite; bundled = no system library needed.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Codex compresses rollouts older than a week (.jsonl.zst); pure Rust decoder.
+ruzstd = "0.8"

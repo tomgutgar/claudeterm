@@ -1,4 +1,5 @@
-//! The four tabs: Sessions, Agents, Worktrees and Usage.
+//! The dashboard tabs: Sessions, Agents, Worktrees and Usage (the same views
+//! serve Claude Code and Antigravity, each over its own `Store`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Row, Sparkline, Table};
 
-use crate::data::{self, Store, Usage, clip, context_window};
+use crate::data::{self, Cli, Store, Usage, clip};
 use crate::i18n::tr;
 use crate::platform;
 use crate::ui::{self, DIM, ListView, block_c, fmt_tokens};
@@ -43,12 +44,16 @@ pub enum Action {
         title: String,
         text: String,
     },
+    /// Open that CLI's dashboard (from the home screen).
+    Open(Cli),
 }
 
 pub trait View {
     fn title(&self) -> &'static str;
     fn accent(&self) -> Color;
     fn refresh(&mut self, st: &Store);
+    /// Home-screen views see every CLI (one `Store` each, in `Cli::ALL` order).
+    fn refresh_all(&mut self, _stores: &[Store]) {}
     fn draw(&mut self, f: &mut Frame, area: Rect);
     fn on_key(&mut self, key: KeyEvent) -> Action;
     fn footer(&self) -> &'static str;
@@ -60,15 +65,42 @@ pub trait View {
     fn clip(&self) -> Option<String> {
         None
     }
+    /// A left click: true if it selected something (a second one = Enter).
+    fn click(&mut self, x: u16, y: u16) -> bool {
+        self.list().is_some_and(|l| l.click(x, y))
+    }
+    /// Redrawn several times a second (animations).
+    fn animated(&self) -> bool {
+        false
+    }
 }
 
-pub fn all() -> Vec<Box<dyn View>> {
-    vec![
-        Box::new(Sessions::default()),
-        Box::new(Agents::default()),
-        Box::new(Worktrees::default()),
-        Box::new(UsageView::default()),
-    ]
+pub fn all(cli: Cli) -> Vec<Box<dyn View>> {
+    let sessions = Box::new(Sessions {
+        cli,
+        ..Default::default()
+    });
+    let worktrees = Box::new(Worktrees {
+        cli,
+        ..Default::default()
+    });
+    let usage = Box::new(UsageView {
+        cli,
+        ..Default::default()
+    });
+    match cli {
+        // agy has no subagents.
+        Cli::Agy => vec![sessions, worktrees, usage],
+        _ => vec![
+            sessions,
+            Box::new(Agents {
+                cli,
+                ..Default::default()
+            }),
+            worktrees,
+            usage,
+        ],
+    }
 }
 
 // ───────────────────────── helpers ─────────────────────────
@@ -160,6 +192,25 @@ fn money(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// Cost, or "—" for the CLIs without a price table (tokens only).
+fn cost(cli: Cli, usd: f64) -> String {
+    if cli.priced() {
+        money(usd)
+    } else {
+        "—".into()
+    }
+}
+
+/// The transcript of a session or subagent, read the way its CLI writes it.
+fn transcript(cli: Cli, path: &std::path::Path, id: &str) -> String {
+    match cli {
+        Cli::Claude => data::transcript(path, 200),
+        Cli::Agy => crate::agy::transcript(id),
+        Cli::Codex => crate::codex::transcript(path),
+        Cli::Kimi => crate::kimi::transcript(path),
+    }
+}
+
 /// Tokens and cost summed per key.
 fn tally<'a>(
     st: &'a Store,
@@ -186,9 +237,9 @@ fn ago(t: SystemTime) -> String {
     }
 }
 
-/// Opens Claude Code in a new terminal, if the directory still exists and
-/// the terminal is installed.
-fn open_here(cwd: &str, claude_args: &[&str]) -> Action {
+/// Opens the CLI in a new terminal, if the directory still exists and the
+/// terminal is installed.
+fn open_here(cli: Cli, cwd: &str, args: &[&str]) -> Action {
     if let Some(term) = platform::terminal_missing() {
         return Action::Show {
             title: s(tr("No se puede abrir", "Can't open")),
@@ -208,7 +259,7 @@ fn open_here(cwd: &str, claude_args: &[&str]) -> Action {
             ),
         };
     }
-    Action::Spawn(platform::open_claude(cwd, claude_args))
+    Action::Spawn(platform::open_cli(cli.prog(), cwd, args))
 }
 
 // ───────────────────────── Sessions ─────────────────────────
@@ -217,12 +268,11 @@ struct SessRef {
     path: PathBuf,
     cwd: String,
     pid: Option<u32>,
-    /// pid of its terminal window (only live sessions with a known window).
-    window: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct Sessions {
+    cli: Cli,
     list: Option<ListView>,
     refs: HashMap<String, SessRef>,
 }
@@ -232,10 +282,11 @@ impl View for Sessions {
         tr("Sesiones", "Sessions")
     }
     fn accent(&self) -> Color {
-        Color::Rgb(0xd9, 0x77, 0x57) // Claude orange
+        self.cli.color()
     }
 
     fn refresh(&mut self, st: &Store) {
+        let money = |usd: f64| cost(self.cli, usd);
         // The session's own tokens and its subagents', separately.
         let main = tally(st, |r| r.agent.is_none().then_some(r.session.as_str()));
         let agents = tally(st, |r| r.agent.is_some().then_some(r.session.as_str()));
@@ -261,7 +312,7 @@ impl View for Sessions {
             } else {
                 ("◌", tr("esperando ", "waiting"), Color::Yellow)
             };
-            let title = data::title(&st.windows, l);
+            let title = l.name.as_str();
             let mut spans = vec![
                 Span::styled(
                     format!("{icon} {label} "),
@@ -272,7 +323,7 @@ impl View for Sessions {
             ];
             match sess.filter(|s| s.last.is_some()) {
                 Some(s) => {
-                    let pct = s.context * 100 / context_window(&s.model).max(1);
+                    let pct = s.context_pct();
                     spans.push(Span::styled(
                         format!("{:<14} ", clip(branch(&s.branch), 14)),
                         cyan,
@@ -295,13 +346,15 @@ impl View for Sessions {
                     path: sess.map(|s| s.path.clone()).unwrap_or_default(),
                     cwd: l.cwd.clone(),
                     pid: Some(l.pid),
-                    window: st.windows.get(&l.pid).map(|w| w.pid),
                 },
             );
         }
         if st.live.is_empty() {
             rows.push((
-                Line::styled(tr("  (ningún claude abierto)", "  (no claude open)"), dim),
+                Line::styled(
+                    crate::tr!("  (ningún {} abierto)", "  (no {} open)", self.cli.prog()),
+                    dim,
+                ),
                 String::new(),
             ));
         }
@@ -338,7 +391,6 @@ impl View for Sessions {
                     path: sess.path.clone(),
                     cwd: sess.cwd.clone(),
                     pid: None,
-                    window: None,
                 },
             );
         }
@@ -350,7 +402,7 @@ impl View for Sessions {
         self.list.get_or_insert_with(ListView::new).draw(
             f,
             area,
-            tr("Sesiones de Claude Code", "Claude Code sessions"),
+            &crate::tr!("Sesiones de {}", "{} sessions", self.cli.name()),
             color,
         );
     }
@@ -369,31 +421,34 @@ impl View for Sessions {
         match key.code {
             KeyCode::Enter => Action::Show {
                 title: format!("Transcript {id}"),
-                text: data::transcript(&r.path, 200),
+                text: transcript(self.cli, &r.path, &id),
             },
-            // If it's already open, resuming would duplicate it: go to its window.
-            KeyCode::Char('g' | 'o') if r.pid.is_some() => match r.window {
-                Some(w) => Action::Run {
-                    cmd: platform::focus_cmd(w),
-                    confirm: None,
-                    show: false,
-                },
-                None => Action::Show {
-                    title: s(tr("Sin ventana", "No window")),
-                    text: s(tr(
-                        "No encuentro su ventana (ir a la ventana necesita Hyprland).",
-                        "Can't find its window (going to the window needs Hyprland).",
-                    )),
-                },
+            // Resuming an open session would run it twice.
+            KeyCode::Char('o') if r.pid.is_some() => Action::Show {
+                title: s(tr("Ya está abierta", "Already open")),
+                text: s(tr(
+                    "Esa sesión ya está abierta en otra terminal: reanudarla la duplicaría.",
+                    "That session is already open in another terminal: resuming it would run it twice.",
+                )),
             },
-            KeyCode::Char('o') => open_here(&r.cwd, &["--resume", &id]),
-            KeyCode::Char('n') => open_here(&r.cwd, &[]),
+            KeyCode::Char('o') => open_here(self.cli, &r.cwd, &[self.cli.resume_flag(), &id]),
+            KeyCode::Char('n') => open_here(self.cli, &r.cwd, &[]),
             KeyCode::Char('k') => match r.pid {
+                // Codex and Kimi keep no pid on disk: there's nothing safe to kill.
+                Some(0) => Action::Show {
+                    title: s(tr("Sin pid", "No pid")),
+                    text: crate::tr!(
+                        "{} no guarda el pid de sus sesiones: ciérrala desde su ventana.",
+                        "{} doesn't store its sessions' pid: close it from its window.",
+                        self.cli.name()
+                    ),
+                },
                 Some(pid) => Action::Run {
                     cmd: platform::kill(pid),
                     confirm: Some(crate::tr!(
-                        "¿Cerrar la sesión de Claude en {} (pid {pid})?",
-                        "Close the Claude session in {} (pid {pid})?",
+                        "¿Cerrar la sesión de {} en {} (pid {pid})?",
+                        "Close the {} session in {} (pid {pid})?",
+                        self.cli.name(),
                         short_path(&r.cwd)
                     )),
                     show: false,
@@ -406,8 +461,8 @@ impl View for Sessions {
 
     fn footer(&self) -> &'static str {
         tr(
-            "Enter transcript · g ir a su ventana · o reanudar · n nueva aquí · k cerrar · / filtrar",
-            "Enter transcript · g go to window · o resume · n new here · k close · / filter",
+            "Enter transcript · o reanudar · n nueva aquí · k cerrar · / filtrar",
+            "Enter transcript · o resume · n new here · k close · / filter",
         )
     }
 
@@ -427,6 +482,7 @@ const AGENT_ACTIVE: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Default)]
 pub struct Agents {
+    cli: Cli,
     list: Option<ListView>,
     paths: HashMap<String, PathBuf>,
 }
@@ -502,7 +558,7 @@ impl View for Agents {
         ) {
             (KeyCode::Enter, Some((id, path))) => Action::Show {
                 title: crate::tr!("Agente {id}", "Agent {id}"),
-                text: data::transcript(path, 200),
+                text: transcript(self.cli, path, &id),
             },
             _ => Action::Ignored,
         }
@@ -531,6 +587,7 @@ const WT_DAYS: i64 = 7;
 
 #[derive(Default)]
 pub struct Worktrees {
+    cli: Cli,
     list: Option<ListView>,
     /// worktree path → main repo path
     main_of: HashMap<String, String>,
@@ -684,7 +741,7 @@ impl View for Worktrees {
             self.git_cache.clear();
         }
         match key.code {
-            KeyCode::Char('n') => open_here(&path, &[]),
+            KeyCode::Char('n') => open_here(self.cli, &path, &[]),
             // New worktree next to the repo: <repo>-<branch>.
             KeyCode::Char('c') => Action::Prompt {
                 label: crate::tr!(
@@ -724,10 +781,24 @@ impl View for Worktrees {
     }
 
     fn footer(&self) -> &'static str {
-        tr(
-            "n claude aquí · c nuevo worktree · x borrar worktree · / filtrar",
-            "n claude here · c new worktree · x delete worktree · / filter",
-        )
+        match self.cli {
+            Cli::Claude => tr(
+                "n claude aquí · c nuevo worktree · x borrar worktree · / filtrar",
+                "n claude here · c new worktree · x delete worktree · / filter",
+            ),
+            Cli::Agy => tr(
+                "n agy aquí · c nuevo worktree · x borrar worktree · / filtrar",
+                "n agy here · c new worktree · x delete worktree · / filter",
+            ),
+            Cli::Codex => tr(
+                "n codex aquí · c nuevo worktree · x borrar worktree · / filtrar",
+                "n codex here · c new worktree · x delete worktree · / filter",
+            ),
+            Cli::Kimi => tr(
+                "n kimi aquí · c nuevo worktree · x borrar worktree · / filtrar",
+                "n kimi here · c new worktree · x delete worktree · / filter",
+            ),
+        }
     }
 
     fn clip(&self) -> Option<String> {
@@ -751,6 +822,7 @@ const PERIODS: [(&str, &str, Option<i64>); 4] = [
 
 #[derive(Default)]
 pub struct UsageView {
+    cli: Cli,
     summary: Vec<Line<'static>>,
     footprint: Vec<Line<'static>>,
     /// Daily cost of the last 30 days, in cents (the sparkline wants integers).
@@ -777,6 +849,7 @@ impl View for UsageView {
     }
 
     fn refresh(&mut self, st: &Store) {
+        let money = |usd: f64| cost(self.cli, usd);
         let now = Utc::now();
         let today = Local::now().date_naive();
         let day = |t: &DateTime<Utc>| t.with_timezone(&Local).date_naive();
@@ -886,8 +959,8 @@ impl View for UsageView {
             fp_line("Total        ", Some(au)),
             Line::styled(
                 tr(
-                    "Cifra central y (mín–máx) según estudios de 2025–2026. Anthropic no publica estos datos: es una aproximación. Fuentes en el README.",
-                    "Central figure and (min–max) from 2025–2026 studies. Anthropic doesn't publish this data: it's an approximation. Sources in the README.",
+                    "Cifra central y (mín–máx) según estudios de 2025–2026. Ni Anthropic ni Google publican estos datos: es una aproximación. Fuentes en el README.",
+                    "Central figure and (min–max) from 2025–2026 studies. Neither Anthropic nor Google publish this data: it's an approximation. Sources in the README.",
                 ),
                 Style::default().fg(DIM),
             ),
@@ -917,13 +990,19 @@ impl View for UsageView {
         let mut five = limit_line(tr("Límite 5 h   ", "5 h limit    "), &limits.five_hour);
         five.spans
             .push(Span::styled(updated, Style::default().fg(DIM)));
-        self.summary = vec![
-            five,
-            limit_line(tr("Semanal      ", "Weekly       "), &limits.seven_day),
-            Line::from(vec![
-                Span::styled(tr("Tokens 5 h   ", "5 h tokens   "), bold),
-                Span::raw(block.unwrap_or_else(|| s(tr("ninguno activo", "none active")))),
-            ]),
+        // The limits and the 5 h block are Claude subscription things.
+        self.summary = match self.cli {
+            Cli::Claude => vec![
+                five,
+                limit_line(tr("Semanal      ", "Weekly       "), &limits.seven_day),
+                Line::from(vec![
+                    Span::styled(tr("Tokens 5 h   ", "5 h tokens   "), bold),
+                    Span::raw(block.unwrap_or_else(|| s(tr("ninguno activo", "none active")))),
+                ]),
+            ],
+            _ => vec![],
+        };
+        self.summary.extend([
             Line::from(vec![
                 Span::styled(tr("Hoy          ", "Today        "), bold),
                 Span::raw(format!("{} tokens · {}", fmt_tokens(tu.total()), money(tc))),
@@ -933,18 +1012,31 @@ impl View for UsageView {
                 Span::raw(format!("{} · {}", fmt_tokens(au.total()), money(ac))),
             ]),
             Line::styled(
-                tr(
-                    "Coste = equivalente a precio de API. Con suscripción no pagas esto, pero sirve para comparar.",
-                    "Cost = API-price equivalent. With a subscription you don't pay this, but it's useful to compare.",
-                ),
+                if self.cli.priced() {
+                    s(tr(
+                        "Coste = equivalente a precio de API. Con suscripción no pagas esto, pero sirve para comparar.",
+                        "Cost = API-price equivalent. With a subscription you don't pay this, but it's useful to compare.",
+                    ))
+                } else {
+                    crate::tr!(
+                        "Sin tabla de precios para los modelos de {}: solo tokens.",
+                        "No price table for {}'s models: tokens only.",
+                        self.cli.name()
+                    )
+                },
                 Style::default().fg(DIM),
             ),
-        ];
+        ]);
 
         let mut per_day: BTreeMap<NaiveDate, f64> = (0..30).map(|d| (since(d), 0.0)).collect();
         for r in all() {
             if let Some(c) = per_day.get_mut(&day(&r.ts)) {
-                *c += r.usage.cost(&r.model).unwrap_or(0.0);
+                *c += if self.cli.priced() {
+                    r.usage.cost(&r.model).unwrap_or(0.0)
+                } else {
+                    // Hundreds of tokens, so the ×100 below keeps them integers.
+                    r.usage.total() as f64 / 100.0
+                };
             }
         }
         self.max_day = per_day.values().copied().fold(0.0, f64::max);
@@ -970,6 +1062,7 @@ impl View for UsageView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect) {
+        let money = |usd: f64| cost(self.cli, usd);
         let color = self.accent();
         let [top, foot, spark, tables] = Layout::vertical([
             Constraint::Length(7),
@@ -1021,11 +1114,19 @@ impl View for UsageView {
                 .data(&wide)
                 .style(Style::default().fg(color))
                 .block(block_c(
-                    &crate::tr!(
-                        "Coste diario, últimos 30 días (máx {})",
-                        "Daily cost, last 30 days (max {})",
-                        money(self.max_day)
-                    ),
+                    &if self.cli.priced() {
+                        crate::tr!(
+                            "Coste diario, últimos 30 días (máx {})",
+                            "Daily cost, last 30 days (max {})",
+                            money(self.max_day)
+                        )
+                    } else {
+                        crate::tr!(
+                            "Tokens diarios, últimos 30 días (máx {})",
+                            "Daily tokens, last 30 days (max {})",
+                            fmt_tokens((self.max_day * 100.0) as u64)
+                        )
+                    },
                     color,
                 )),
             spark,

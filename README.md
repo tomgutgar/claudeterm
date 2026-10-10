@@ -2,7 +2,7 @@
 
 # claudeterm
 
-**A terminal dashboard for Claude Code.** A TUI (`cct`) that shows at a glance which Claude Code sessions you have open, which ones are working and which are waiting for your reply, which subagents they launched, which git worktree each one is in, and how many tokens (and how much API-equivalent money) you've used.
+**A terminal dashboard for Claude Code, Antigravity, Codex and Kimi Code.** A TUI (`cct`) that shows at a glance which Claude Code, Antigravity CLI (`agy`), OpenAI Codex CLI (`codex`) and Kimi Code CLI (`kimi`) sessions you have open, which ones are working and which are waiting for your reply, which subagents and background shells they launched, which git worktree each one is in, and how many tokens (and how much API-equivalent money) you've used.
 
 Little sibling of [DevTerminal](https://github.com/tomgutgar/DevTerminal): same skeleton, same keys. Runs on **Linux** and **Windows**.
 
@@ -19,7 +19,52 @@ Claude Code keeps everything it does in `~/.claude/`. claudeterm **only reads** 
 
 Each refresh (every 2 s) only reads what's new in each file, so it starts fast even with a long history.
 
-On Hyprland, each open session is named after its window title (Claude puts the topic of the conversation there), queried with `hyprctl`. Without Hyprland (another desktop, or Windows) the name Claude Code gives the session is used.
+Background shells (Bash run with `run_in_background`) are taken from the transcripts too: the result that starts them, the `<task-notification>` that ends them, and their output file (if it changed in the last 5 s, the shell is working).
+
+### Antigravity
+
+Antigravity CLI keeps its data in `~/.gemini/antigravity-cli/`, also read-only:
+
+| File | What's taken from it |
+|---|---|
+| `log/cli-<date>.log` | One per `agy` process: its pid, workspace and conversation. A process still alive and without "shutting down" in its log is an **open session**; it counts as **working** while its log is being written or its last step is still running |
+| `conversations/<id>.db` | SQLite with protobuf rows: workspace, branch, model, **tokens** of every reply and the status of each step |
+| `annotations/<id>.pbtxt` | The conversation's title |
+| `history.jsonl` | Your prompts (the "transcript" of an Antigravity session) |
+
+These formats aren't documented: the field numbers were worked out from real files (agy 1.3), and anything unexpected is skipped instead of breaking.
+
+### Codex
+
+Codex CLI keeps its data in `~/.codex/` (or `$CODEX_HOME`), read-only. Both CLIs below are open source, so their formats were taken from their code ([openai/codex](https://github.com/openai/codex), [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code)), and the tests use records shaped like their own test fixtures.
+
+| File | What's taken from it |
+|---|---|
+| `sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` | One per thread: directory, branch, model, your messages and the **tokens** (`token_count` events, cumulative: each reply is the growth). A thread with a `session_id` other than its own is a **subagent** of that session. After a week codex compresses them (`.jsonl.zst`), also read; `archived_sessions/` too |
+| `thread-writer-locks/<id>.lock` | Locked while a `codex` process has that thread open: an **open session**. It counts as **working** while a turn is running (`task_started` without `task_complete`) or the rollout is being written |
+
+### Kimi Code
+
+Kimi Code CLI keeps its data in `~/.kimi-code/` (or `$KIMI_CODE_HOME`), read-only:
+
+| File | What's taken from it |
+|---|---|
+| `session_index.jsonl`, `sessions/<dir>/<id>/state.json` | Each session's directory and title |
+| `…/<id>/agents/main/wire.jsonl` | The session's events: the **tokens** of every model request (`usage.record`), turns starting and ending (**working** in between), and the **subagents** it launched (`subagent.spawned`…) |
+| `…/<id>/agents/agent-N/wire.jsonl` | Each subagent's own tokens |
+| `…/<id>/tasks/<task>.json` + `output.log` | Its **background shells** |
+
+Kimi writes no pid or lock per session, so the open ones are a guess: as many sessions as `kimi` processes are running, the most recently written since the oldest of those processes started.
+
+## Home screen and agent hub
+
+`cct` opens on a home screen with two tabs:
+
+1. **Home**: the four CLIs' logos in a 2×2 grid (Claude Code, Antigravity and Kimi drawn from their own startup banners; Codex as OpenAI's ChatGPT logo), with how many sessions of each are working / waiting. Arrows and `Enter` (or a double click) open that CLI's dashboard; `Esc` (or the **← Esc home** button) comes back. `cct --claude` / `--agy` / `--codex` / `--kimi` skip it.
+2. **Hub**: a live tree of everything running. This PC at the root; under it every open session (Claude's orange mascot, Antigravity's blue logo, Codex's green ChatGPT logo, Kimi's light-blue logo); under each session its **subagents** (its CLI's logo, same colour) and **background shells** (a small white monitor); one level further down, shells launched by a subagent show as tags `S1`, `S2`…
+   - Each branch has the colour of its child. **Waiting**: a solid line. **Working**: a dotted line whose dots march from parent to child.
+   - Icons move too: working, all the time (the mascot types, the Antigravity logo floats, Kimi's bobs, Codex's floats, the shell's cursor runs); waiting, a short twitch every 5 s.
+   - Arrows walk the tree (`←`/`→` in order, `↑` parent, `↓` first child); the bottom line describes the selection; `Enter` opens its CLI's dashboard.
 
 ### Its own history
 
@@ -36,7 +81,9 @@ To avoid gaps, open `cct` at least once a month, or raise Claude Code's limit in
 | 3 | **Worktrees** | Repos with sessions in the last 7 days, their worktrees and which live session is in each one |
 | 4 | **Usage** | **% used of the 5-hour and weekly limits** (with the time each one resets), tokens and cost of the current block, today / 30 days / total, daily cost chart, tables by model and by project, and an estimated energy/water/CO₂ footprint |
 
-Also, **even while you're on another tab**, when a session goes from working to waiting you get a desktop notification ("Claude is waiting for you"). On Hyprland, **click the notification** to jump to that session's window.
+Antigravity's dashboard has the same tabs except **Agents** (agy doesn't record subagents). Antigravity's, Codex's and Kimi's Usage tabs show tokens only (there's no price table for their models) and have no limits.
+
+Also, **even while you're on another tab**, when a session goes from working to waiting you get a desktop notification ("Claude Code is waiting for you" / "Antigravity is waiting for you").
 
 ## Statusline and limit percentages
 
@@ -75,15 +122,7 @@ The central figure is shown with the min–max range in parentheses (×0.3 to ×
 A small **always-on-top** window with the logo and the 5-hour and weekly limits (with their reset times). It updates every 2 s; `q` or `Esc` closes it. It needs the cct statusline to have data.
 
 - **Windows:** `install.ps1` puts a **claudeterm mini** shortcut on the desktop that opens a 48×6 Windows Terminal window. `cct` keeps it on top by itself.
-- **Linux (Hyprland):** open it with its own class and let Hyprland make it floating, pinned to every workspace and borderless. For example, in `hyprland.conf` (rule syntax changes between Hyprland versions; adapt it to yours):
-
-  ```
-  bind = SUPER, U, exec, kitty --class claudeterm-mini -o initial_window_width=48c -o initial_window_height=6c -e cct --mini
-  windowrulev2 = float, class:^(claudeterm-mini)$
-  windowrulev2 = pin, class:^(claudeterm-mini)$
-  windowrulev2 = noborder, class:^(claudeterm-mini)$
-  windowrulev2 = move 100%-420 40, class:^(claudeterm-mini)$
-  ```
+- **Linux:** open it in a small terminal window (48×6) and keep it floating and on top with your window manager's rules.
 
 ## Waybar module
 
@@ -110,6 +149,7 @@ It's the **API-price equivalent** (what it would cost paying per token). With a 
 |---|---|
 | `Tab` / `D` · `Shift+Tab` / `A` | Next · previous tab |
 | `1`–`4` | Jump to a tab |
+| `Esc` / `Backspace` | Back to the home screen (from a dashboard) |
 | `W` / `S` (or arrows), `PgUp` / `PgDn` | Move through the list |
 | `/` or `F` | Filter the list (`Esc` clears the filter) |
 | `y` | Copy the selection (session id, path…) |
@@ -123,10 +163,9 @@ Per-tab keys (also shown in the bottom bar):
 | Tab | Key | Action |
 |---|---|---|
 | Sessions | `Enter` | View the transcript (opens at the end; `g`/`G` start/end) |
-| | `g` | **Go to the window** of that session (switches workspace if needed) |
-| | `o` | Resume the session in a new terminal (`claude --resume`); if it's already open, go to its window |
-| | `n` | Open a new Claude in that directory |
-| | `k` | Close the session (asks for confirmation) |
+| | `o` | Resume the session in a new terminal (`claude --resume` / `agy --conversation` / `codex resume` / `kimi --session`); if it's already open, it tells you instead of running it twice |
+| | `n` | Open a new Claude (or agy, codex, kimi) in that directory |
+| | `k` | Close the session (asks for confirmation; Codex and Kimi store no pid, so not for them) |
 | Agents | `Enter` | View the subagent's transcript |
 | Worktrees | `n` | Open Claude in that worktree |
 | | `c` | Create a new worktree (asks for the branch name; created at `<repo>-<branch>`, with `/` turned into `-`) |
@@ -158,7 +197,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 ### Optional tools
 
-- **Linux:** a terminal to open sessions in (`kitty` by default; pick another with `CCT_TERMINAL`, e.g. `export CCT_TERMINAL="alacritty -e"` or `"gnome-terminal --"`; cct tells you if it can't find it), `notify-send` (notifications), `wl-copy` or `xclip` (copy) and `git` (worktrees). Hyprland is optional: it's only needed for window titles and jumping to a window.
+- **Linux:** a terminal to open sessions in (`kitty` by default; pick another with `CCT_TERMINAL`, e.g. `export CCT_TERMINAL="alacritty -e"` or `"gnome-terminal --"`; cct tells you if it can't find it), `notify-send` (notifications), `wl-copy` or `xclip` (copy) and `git` (worktrees).
 - **Windows:** `git`. Sessions open in Windows Terminal (`wt`) with the Command Prompt profile, notifications are Windows toasts and copying uses `clip`. Building with Rust's GNU toolchain needs mingw-w64 on the PATH; the default MSVC toolchain works as is.
 
 ## Language
@@ -171,6 +210,9 @@ The UI is in **English** or **Spanish**, picked from `LC_ALL` / `LC_MESSAGES` / 
 cargo test
 # Check the totals against your real ~/.claude:
 cargo test -- --ignored --nocapture real_totals
+# What it reads from a real ~/.codex or ~/.kimi-code (or $CODEX_HOME / $KIMI_CODE_HOME):
+cargo test -- --ignored --nocapture codex::tests::real_home
+cargo test -- --ignored --nocapture kimi::tests::real_home
 ```
 
 ## Known limitations
@@ -178,11 +220,16 @@ cargo test -- --ignored --nocapture real_totals
 - The format of the files in `~/.claude` is not a public Claude Code API: an update may change it. The reader skips what it doesn't understand instead of breaking.
 - A subagent can't be closed on its own: it runs inside its session's `claude` process.
 - Limit percentages only arrive through the statusline: without it, Usage shows tokens but no %.
-- Going to a window (`g` and clicking the notification) needs Hyprland and the session running in its own window.
+- Antigravity's working / waiting is inferred (log activity and the last step's status), and its token fields are read from undocumented protobuf: a new agy version may need an update in `src/agy.rs`.
+- Which Kimi sessions are open is a guess (see above): a resumed session shows up after its first message, and a `kimi` installed with npm runs as `node` and isn't seen.
+- Codex and Kimi formats change with their versions (checked against their code in October 2026): an update may need a change in `src/codex.rs` / `src/kimi.rs`.
+- A background shell killed without Claude Code noticing (e.g. the session crashed) stays in the hub until its session closes.
 
 ## Logo
 
-The claudeterm logo (`assets/logo.svg`) is **original**: a terminal with the prompt in orange. The Claude / Claude Code logo is an Anthropic trademark and isn't used. In the Usage tab it's drawn with characters (half blocks), so it works in any terminal without an image protocol. The PNGs and the ICO are rebuilt with `uv run --with playwright --with pillow python assets/build.py`.
+The claudeterm logo (`assets/logo.svg`) is **original**: a terminal with the prompt in orange. In the Usage tab it's drawn with characters (half blocks), so it works in any terminal without an image protocol.
+
+The home screen and the hub draw the Claude Code mascot, the Antigravity logo and the Kimi Code logo exactly as each CLI prints them in its own terminal banner, and Codex as OpenAI's logo (from Simple Icons), only to tell them apart. They are trademarks of Anthropic, Google, OpenAI and Moonshot AI respectively; claudeterm isn't affiliated with any of them. The PNGs and the ICO are rebuilt with `uv run --with playwright --with pillow python assets/build.py`.
 
 claudeterm is an independent project, not affiliated with or endorsed by Anthropic.
 
